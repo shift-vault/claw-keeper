@@ -14,9 +14,12 @@ permissions:
 
 jobs:
   pass:
+    # only in this repository: a fork or a copy must not run a second keeper by accident (edit the name to run one)
+    if: ${{ github.repository == 'shift-vault/claw-keeper' }}
     runs-on: ubuntu-latest
     # a pass is normally well under a minute; the limit leaves room for a long queue (up to SWEEP_MAX = 500 settles a
-    # vault, one transaction each) without letting a hung pass hold the next ones back for most of the settle window
+    # vault, one transaction each) without letting a hung pass hold the next ones back for most of the settle window.
+    # A pass cut off by it is cancelled, and its marks are not saved: the next run goes on from the last saved ones.
     timeout-minutes: 30
     # never two passes at once; a run that arrives while one is going waits for it instead of cancelling it
     concurrency:
@@ -29,10 +32,11 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
         with:
-          version: v1.5.1
+          version: v1.7.1 # the release the fork drill (test/fork-drill.sh) was run with
           cache: false
 
-      # the low-water marks: restore the newest saved state, save a new entry after the pass
+      # the low-water marks: restore the newest saved state; after the pass, save a new entry if there is a mark to
+      # keep (see the save step)
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: state
@@ -45,7 +49,9 @@ jobs:
       - name: BNB Chain (56)
         env:
           CHAIN_ID: "56"
-          RPC: ${{ vars.RPC_56 || 'https://bsc-mainnet.public.blastapi.io' }}
+          # a URL with an API key belongs in the secret RPC_56: Actions prints each step's env at the top of its log,
+          # and masks only secrets there
+          RPC: ${{ secrets.RPC_56 || vars.RPC_56 || 'https://bsc-mainnet.public.blastapi.io' }}
           KEEPER_PK: ${{ secrets.KEEPER_PK }}
           STATE_DIR: state
         run: ./keeper.sh
@@ -54,13 +60,15 @@ jobs:
         if: ${{ !cancelled() && vars.RUN_97 == 'true' }}
         env:
           CHAIN_ID: "97"
-          RPC: ${{ vars.RPC_97 || 'https://bsc-testnet-rpc.publicnode.com' }}
+          RPC: ${{ secrets.RPC_97 || vars.RPC_97 || 'https://bsc-testnet-rpc.publicnode.com' }}
           KEEPER_PK: ${{ secrets.KEEPER_PK }}
           STATE_DIR: state
         run: ./keeper.sh
 
+      # only when state/ holds a mark file (restored, or written by this pass): after a restore that missed and a pass
+      # that wrote nothing, an empty entry would become the newest and hide the older good one from the next restore
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && hashFiles('state/claw-*.from') != '' }}
         with:
           path: state
           key: keeper-state-${{ github.run_id }}-${{ github.run_attempt }}
@@ -69,7 +77,7 @@ jobs:
   # the age of the newest commit and, when it is 30 days or older, commits a one-line heartbeat file with the
   # workflow's own token. The only job that may write to the repository.
   keepalive:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '17 3 * * *' }}
+    if: ${{ github.repository == 'shift-vault/claw-keeper' && github.event_name == 'schedule' && github.event.schedule == '17 3 * * *' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
