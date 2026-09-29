@@ -1,0 +1,94 @@
+name: keeper
+
+# One keeper pass every 5 minutes: settle the claw vaults' settle queues from their heads and arm the shots the
+# Trigger Service never anchored. Once a day a keep-alive job makes sure GitHub never turns the schedule off.
+# See README.md.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    - cron: "17 3 * * *" # daily: the same pass, plus the keep-alive job
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pass:
+    runs-on: ubuntu-latest
+    # a pass is normally well under a minute; the limit leaves room for a long queue (up to SWEEP_MAX = 500 settles a
+    # vault, one transaction each) without letting a hung pass hold the next ones back for most of the settle window
+    timeout-minutes: 30
+    # never two passes at once; a run that arrives while one is going waits for it instead of cancelling it
+    concurrency:
+      group: claw-keeper-pass
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.5.1
+          cache: false
+
+      # the low-water marks: restore the newest saved state, save a new entry after the pass
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: state
+          key: keeper-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: keeper-state-
+
+      - name: State directory
+        run: mkdir -p state
+
+      - name: BNB Chain (56)
+        env:
+          CHAIN_ID: "56"
+          RPC: ${{ vars.RPC_56 || 'https://bsc-mainnet.public.blastapi.io' }}
+          KEEPER_PK: ${{ secrets.KEEPER_PK }}
+          STATE_DIR: state
+        run: ./keeper.sh
+
+      - name: BNB Chain testnet (97)
+        if: ${{ !cancelled() && vars.RUN_97 == 'true' }}
+        env:
+          CHAIN_ID: "97"
+          RPC: ${{ vars.RPC_97 || 'https://bsc-testnet-rpc.publicnode.com' }}
+          KEEPER_PK: ${{ secrets.KEEPER_PK }}
+          STATE_DIR: state
+        run: ./keeper.sh
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !cancelled() }}
+        with:
+          path: state
+          key: keeper-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # GitHub turns off the schedule of a public repository after 60 days without activity. Once a day this job checks
+  # the age of the newest commit and, when it is 30 days or older, commits a one-line heartbeat file with the
+  # workflow's own token. The only job that may write to the repository.
+  keepalive:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '17 3 * * *' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Heartbeat
+        run: |
+          last="$(git log -1 --format=%ct)"
+          age=$(( ($(date -u +%s) - last) / 86400 ))
+          if [ "$age" -lt 30 ]; then
+            echo "newest commit is $age day(s) old: no heartbeat needed"
+            exit 0
+          fi
+          git config user.name keeper-heartbeat
+          git config user.email keeper-heartbeat
+          date -u +%Y-%m-%dT%H:%M:%SZ > .github/heartbeat
+          git add .github/heartbeat
+          git commit -q -m "heartbeat: keep the keeper schedule active"
+          git push -q || { git pull -q --rebase && git push -q; }
+          echo "newest commit was $age day(s) old: heartbeat committed"
