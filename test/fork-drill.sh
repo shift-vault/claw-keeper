@@ -6,14 +6,18 @@
 #   ANVIL_RPC=http://127.0.0.1:8545 test/fork-drill.sh        (uses an anvil fork of 97 that is already running)
 #
 # SHOOTER_PK (optional): the key that fires the shots on the fork; a fresh key is made when it is not set.
-# The keeper and the rivals always get fresh keys. KEEPER_BASH picks the shell that runs keeper.sh (default: bash).
+# The keeper and the rivals always get fresh keys. KEEPER_BASH picks the shell that runs keeper.sh (default: bash),
+# KEEPER_SH the keeper under test (default: ./keeper.sh). DRILL_ONLY (optional) runs only the sections it names, e.g.
+# DRILL_ONLY="J K" (each section fires its own shots; the setup and the closing checks always run).
 # Needs anvil, cast, bc and python3 (test/fork-relay.py: anvil reads the public endpoint through it, with retries, so
-# a dropped connection there does not strand a transaction in the fork's pool).
+# a dropped connection there does not strand a transaction in the fork's pool; in sections J to L a second relay with
+# a fault rule, between the keeper and the fork, plays a node that answers one kind of call its own way).
 #
 # The fork plays the Trigger Service's backend by impersonating the address that holds its TRIGGER_ROLE: it runs
 # each shot's first request (the anchor) and never the second (the settle), which is exactly the case the keeper
-# exists for. anvil does not write block hashes into the EIP-2935 history contract, so after an anchor block is mined
-# the drill writes that block's hash into the contract's ring slot (block % 8191), as the chain itself does.
+# exists for. anvil (1.7.1, measured) writes each block's parent hash into the EIP-2935 history contract's ring as it
+# mines, reading that ring slot from the public endpoint first; the drill writes an anchor block's hash into its slot
+# (block % 8191) itself as well, so it does not depend on that.
 
 set -u
 set -o pipefail
@@ -34,6 +38,7 @@ PASS=0
 FAIL=0
 ANVIL_PID=""
 RELAY_PID=""
+FAULT_PID=""
 
 fatal() { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 say() {
@@ -43,17 +48,19 @@ say() {
 ok() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$*"; }
 bad() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$*"; }
 check() { if [ "$1" = "$2" ]; then ok "$3 ($1)"; else bad "$3: got $1, want $2"; fi; }
+want() { case " ${DRILL_ONLY:-all} " in *" all "* | *" $1 "*) return 0 ;; esac; return 1; } # want <section>
 
 cleanup() { # only the processes this drill started
   if [ -n "$ANVIL_PID" ]; then kill "$ANVIL_PID" 2>/dev/null; fi
   if [ -n "$RELAY_PID" ]; then kill "$RELAY_PID" 2>/dev/null; fi
+  if [ -n "$FAULT_PID" ]; then kill "$FAULT_PID" 2>/dev/null; fi
 }
 trap cleanup EXIT
+free_port() { local p="$1"; while lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; do p=$((p + 1)); done; echo "$p"; }
 
 if [ -n "${ANVIL_RPC:-}" ]; then
   A="$ANVIL_RPC"
 else
-  free_port() { local p="$1"; while lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; do p=$((p + 1)); done; echo "$p"; }
   rport="$(free_port "${RELAY_PORT:-28645}")"
   python3 test/fork-relay.py "$rport" "$FORK_URL" 2>"$WORK/relay.log" &
   RELAY_PID=$!
@@ -96,7 +103,8 @@ rcall() {
   done
 }
 num() { rcall "$@" | awk '{ print $1; exit }'; }
-mine() { c rpc anvil_mine "$(printf '0x%x' "${1:-1}")" >/dev/null; }
+# a failed anvil_mine goes on mining in the fork after cast gave up on it, under the drill's feet: stop there
+mine() { c rpc anvil_mine "$(printf '0x%x' "${1:-1}")" >/dev/null || fatal "anvil_mine ${1:-1} failed"; }
 fund() { c rpc anvil_setBalance "$1" 0xde0b6b3a7640000 >/dev/null; } # 1 BNB, on the fork
 unlocked() { # unlocked <from> <to> <sig> [args...]
   local from="$1"
@@ -108,15 +116,20 @@ unlocked() { # unlocked <from> <to> <sig> [args...]
   c rpc anvil_stopImpersonatingAccount "$from" >/dev/null
 }
 newkey() { cast wallet new | sed -n 's/^Private key: *//p'; }
+# use_vault <index>: the shot helpers below work on this vault of the factory (vault 0 unless a section says so)
+use_vault() {
+  VAULT="$(num "$FACTORY" "vaults(uint256)(address)" "$1")"
+  VAULT_LC="$(echo "$VAULT" | tr 'A-F' 'a-f')"
+  TOKEN="$(num "$VAULT" "taxToken()(address)")"
+  QUOTE="$(num "$VAULT" "vaultQuoteToken()(address)")"
+  BULLET="$(num "$VAULT" "BULLET_TOKENS()(uint256)")"
+  for x in "$VAULT" "$TOKEN" "$QUOTE" "$BULLET"; do [ -n "$x" ] || fatal "a read of vault #$1 came back empty"; done
+}
 
-VAULT="$(num "$FACTORY" "vaults(uint256)(address)" 0)"
-VAULT_LC="$(echo "$VAULT" | tr 'A-F' 'a-f')"
-TOKEN="$(num "$VAULT" "taxToken()(address)")"
-QUOTE="$(num "$VAULT" "vaultQuoteToken()(address)")"
+use_vault 0
 SERVICE="$(num "$VAULT" "triggerService()(address)")"
 ROLE="$(num "$SERVICE" "TRIGGER_ROLE()(bytes32)")"
 [ "$(num "$SERVICE" "hasRole(bytes32,address)(bool)" "$ROLE" "$OPERATOR")" = true ] || fatal "OPERATOR has no TRIGGER_ROLE"
-BULLET="$(num "$VAULT" "BULLET_TOKENS()(uint256)")"
 for x in "$VAULT" "$TOKEN" "$QUOTE" "$SERVICE" "$ROLE" "$BULLET"; do [ -n "$x" ] || fatal "a setup read came back empty"; done
 echo "factory $FACTORY: $(num "$FACTORY" "vaultCount()(uint256)") vault(s); vault $VAULT"
 echo "token $TOKEN  quote $QUOTE  service $SERVICE  pool $(num "$VAULT" "pool()(uint256)")"
@@ -179,6 +192,23 @@ fix_history() {
   c rpc anvil_setStorageAt "$HISTORY" "$(printf '0x%x' $(($1 % 8191)))" "$h" >/dev/null
 }
 fix_history_of() { local id; for id in "$@"; do fix_history "$(anchor_of "$id")"; done; }
+# seed_history: set every slot of the EIP-2935 ring on the fork (to zero) in one batch. Mining a block reads its ring
+# slot from the public endpoint first, about 0.4 s a block through the relay: 8,200 blocks would take an hour, far past
+# cast's timeout. Once every slot is local they take seconds. The slots anvil then writes as it mines, and the ones
+# fix_history writes, hold the real hashes; a slot left at zero only serves as a hash nobody asks for.
+seed_history() {
+  python3 - "$A" "$HISTORY" <<'EOF_SEED' || fatal "seeding the history ring failed"
+import json, sys, urllib.request
+url, history = sys.argv[1], sys.argv[2]
+batch = [{"jsonrpc": "2.0", "id": i, "method": "anvil_setStorageAt", "params": [history, hex(i), "0x" + "00" * 32]}
+         for i in range(8191)]
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+req = urllib.request.Request(url, data=json.dumps(batch).encode(), headers={"Content-Type": "application/json"})
+with opener.open(req, timeout=300) as r:
+    out = json.loads(r.read())
+sys.exit(0 if len(out) == len(batch) and not [x for x in out if "error" in x] else 1)
+EOF_SEED
+}
 # keeper <log name> [VAR=value...]: one keeper.sh pass against the fork, output kept in $WORK/<name>.log
 keeper() {
   local name="$1"
@@ -193,8 +223,38 @@ sum_payouts() { local s=0 id; for id in "$@"; do s="$(echo "$s + $(payout_of "$i
 settled_order() { sed -En 's/.*settleFallback\([0-9]+\) tx 0x[0-9a-f]+ gas [0-9]+: shot ([0-9]+) (settled|spent).*/\1/p' "$@" | words; }
 count5() { local n=0 id; for id in "$@"; do [ "$(status "$id")" = 5 ] && n=$((n + 1)); done; echo "$n"; }
 queue_ids() { local s="$1" out=""; while [ "$s" -lt "$2" ]; do out="$out $(num "$VAULT" "queuedShot(uint256)(uint256)" "$s")"; s=$((s + 1)); done; echo "$out" | words; }
+mark() { cat "$WORK/state/claw-97-$VAULT_LC.from" 2>/dev/null; } # the keeper's low-water mark for the vault in use
+set_mark() { printf '%s\n' "$1" >"$WORK/state/claw-97-$VAULT_LC.from"; }
+six_hours() { c rpc evm_increaseTime "$(printf '0x%x' $((6 * 3600 + 5)))" >/dev/null; mine 1; }
+word_of() { cast abi-encode "f(uint256)" "$1" | sed 's/^0x//'; } # a number as one ABI word, 64 hex digits
+tx_of() { sed -En "s/.*$1 tx (0x[0-9a-f]+).*/\\1/p" "$2" | head -1; } # tx_of <call regex> <log>: its transaction
+# rstatus <tx>: 1 if it succeeded, 0 if it reverted (cast 1.7.1 prints true or false; older releases 1 (success) or 0)
+rstatus() {
+  c receipt "$1" status 2>/dev/null | awk '{ s = $1 } END { if (s == "true" || s == "1") print 1; else if (s == "false" || s == "0") print 0; else print s }'
+}
+# fault_start <name> <method>:<call data prefix>[@<block>][=<result>]: a second relay between the keeper and the fork,
+# playing a node that answers that call its own way (see test/fork-relay.py); its own log is relay-<name>.log. Sets
+# FAULT_URL, whose path is a made-up API key (FAULT_KEY) that must never appear in the keeper's log (the node's errors
+# quote it). fault_stop stops it.
+fault_start() {
+  local n=0
+  FAULT_PORT="$(free_port 28745)"
+  FAULT_KEY="drill-secret-$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
+  FAULT_URL="http://127.0.0.1:$FAULT_PORT/$FAULT_KEY"
+  python3 test/fork-relay.py "$FAULT_PORT" "$A" "$2" 2>"$WORK/relay-$1.log" &
+  FAULT_PID=$!
+  until lsof -nP -iTCP:"$FAULT_PORT" -sTCP:LISTEN >/dev/null 2>&1; do
+    n=$((n + 1))
+    [ "$n" -gt 20 ] && fatal "the fault relay did not come up"
+    sleep 0.5
+  done
+}
+fault_stop() { kill "$FAULT_PID" 2>/dev/null; wait "$FAULT_PID" 2>/dev/null; FAULT_PID=""; }
+yes_if() { if "$@"; then echo yes; else echo no; fi; } # yes_if <test...>: "yes" or "no", for check
+grep_n() { local n; n="$(grep -c "$@" 2>/dev/null)"; echo "${n:-0}"; } # grep_n <grep args> <one file>: the count
 
 # 0. before anything: the vault's queue is empty ------------------------------------------------------------------
+if want 0; then
 say "0. an empty queue and nothing overdue: the pass is a no-op"
 check "$(qhead) $(qtail)" "$(qtail) $(qtail)" "the settle queue is empty (head = tail)"
 nonce0="$(c nonce "$KEEPER")"
@@ -203,7 +263,10 @@ check "$KRC" 0 "keeper exit code"
 check "$(c nonce "$KEEPER")" "$nonce0" "no transaction sent"
 check "$(grep -c "nothing to do" "$WORK/Z0.log")" 1 "the pass reports nothing to do"
 
+fi
+
 # A. the service anchors three shots and never delivers their settle requests -----------------------------------------
+if want A; then
 say "A. three ready shots (10, 10 and 100 bullets) whose settle callback never comes"
 A1="$(fire 10 0)" || fatal "fire failed"
 A2="$(fire 10 1)" || fatal "fire failed"
@@ -240,7 +303,10 @@ for id in "$A1" "$A2" "$A3"; do
   check "$(c tx "$tx" gas)" 3000000 "shot $id: settleFallback sent with the explicit 3,000,000 gas limit"
 done
 
+fi
+
 # B. a shot the service never anchors ---------------------------------------------------------------------------------
+if want B; then
 say "B. a shot never anchored: armed 6 h after its fire, settled on the next pass"
 B1="$(fire 1 0)" || fatal "fire failed"
 mine 1
@@ -265,7 +331,10 @@ check "$KRC" 0 "keeper exit code"
 check "$(status "$B1")" 5 "settled by the next pass"
 check "$(cat "$WORK/state/claw-97-$VAULT_LC.from")" "$(num "$VAULT" "nextShotId()(uint256)")" "the mark moved past it"
 
+fi
+
 # C. nothing to do -----------------------------------------------------------------------------------------------------
+if want C; then
 say "C. rerun twice with an empty queue: no-ops"
 check "$(qhead)" "$(qtail)" "the queue is empty"
 nonce0="$(c nonce "$KEEPER")"
@@ -276,7 +345,10 @@ check "$KRC" 0 "keeper exit code"
 check "$(c nonce "$KEEPER")" "$nonce0" "no transaction sent"
 check "$(cat "$WORK/C1.log" "$WORK/C2.log" | grep -c "nothing to do")" 2 "both passes report nothing to do"
 
+fi
+
 # D. thirty shots, anchored in three batches, SWEEP_MAX=20 --------------------------------------------------------------
+if want D; then
 say "D. thirty shots, settled from the head in queue order, 20 a pass (SWEEP_MAX=20), the rest on the next pass"
 D="$(fire_n 30)" || fatal "fire failed"
 # shellcheck disable=SC2086
@@ -309,11 +381,15 @@ check "$(echo "$(qbal "$SHOOTER") - $shooter0" | bc)" "$(sum_payouts $D)" "the s
 check "$(num "$VAULT" "owed(address)(uint256)" "$SHOOTER")" 0 "nothing held for pickup"
 echo "  gas per settleFallback: $(sed -En 's/.* gas ([0-9]+): shot.*/\1/p' "$WORK/D1.log" "$WORK/D2.log" | sort -n | uniq -c | awk '{ printf "%s x %s, ", $1, $2 }')"
 
+fi
+
 # E. spent shots ahead of a ready one -----------------------------------------------------------------------------------
+if want E; then
 say "E. two anchors that expired before the keeper ran, ahead of a ready shot: closed in order, no loop"
 E1="$(fire 1 0)" || fatal "fire failed"
 E2="$(fire 1 1)" || fatal "fire failed"
 anchor_by_service "$E1" "$E2"
+seed_history
 mine 8200
 E3="$(fire 1 2)" || fatal "fire failed"
 anchor_by_service "$E3"
@@ -332,7 +408,10 @@ check "$KRC" 0 "keeper exit code"
 check "$(($(c nonce "$KEEPER") - nonce0))" 3 "the next pass sends nothing"
 check "$(grep -c "nothing to do" "$WORK/E2.log")" 1 "and reports nothing to do"
 
+fi
+
 # F. races ------------------------------------------------------------------------------------------------------------
+if want F; then
 say "F1. the head settled by someone else just before the pass"
 F="$(fire_n 3)" || fatal "fire failed"
 # shellcheck disable=SC2086
@@ -381,9 +460,9 @@ sed 's/^/    | /' "$WORK/F2.log"
 check "$KRC" 0 "keeper exit code after losing the race"
 if [ -n "$raced" ]; then ok "the race happened on shot $raced"; else bad "no race happened"; fi
 rtx="$(cat "$WORK/rival.tx" 2>/dev/null)"
-check "$(c receipt "$rtx" status 2>/dev/null | awk '{ print $1 }')" 1 "the rival's settleFallback succeeded"
+check "$(rstatus "$rtx")" 1 "the rival's settleFallback succeeded"
 ktx="$(sed -En "s/.*settleFallback\\($raced\\) (0x[0-9a-f]+): shot $raced was closed by someone else first.*/\\1/p" "$WORK/F2.log")"
-check "$(c receipt "$ktx" status 2>/dev/null | awk '{ print $1 }')" 0 "the keeper's own transaction was mined and reverted"
+check "$(rstatus "$ktx")" 0 "the keeper's own transaction was mined and reverted"
 check "$(c receipt "$ktx" blockNumber 2>/dev/null)" "$(c receipt "$rtx" blockNumber 2>/dev/null)" "in the same block as the rival's"
 check "$(grep -c "closed by someone else first" "$WORK/F2.log")" 1 "the keeper saw it lose, counted no failure and went on"
 # shellcheck disable=SC2086
@@ -413,7 +492,10 @@ check "$R1 $R2" "0 0" "both keepers exit 0"
 check "$(count5 $H)" 12 "all twelve settled"
 check "$(settled_order "$WORK/F3a.log" "$WORK/F3b.log" | tr ' ' '\n' | sort -n | words)" "$(echo "$H" | tr ' ' '\n' | sort -n | words)" "each shot settled exactly once between them"
 
+fi
+
 # G. an unanchored shot buried under later shots ----------------------------------------------------------------------
+if want G; then
 say "G. an unanchored shot buried under twenty later shots is still armed 6 h on, from the low-water mark"
 V="$(fire 1 0)" || fatal "fire failed"
 L="$(fire_n 20)" || fatal "fire failed"
@@ -438,7 +520,10 @@ keeper G3
 check "$KRC" 0 "keeper exit code"
 check "$(status "$V")" 5 "settled on the next pass"
 
+fi
+
 # H. a real failure: a ready head the chain refuses to settle ----------------------------------------------------------
+if want H; then
 say "H. a ready head whose anchor hash the history contract does not serve: one failed transaction, exit 1, no loop"
 H1="$(fire 1 0)" || fatal "fire failed"
 anchor_by_service "$H1"
@@ -457,7 +542,10 @@ keeper H2
 check "$KRC" 0 "keeper exit code once the hash is served"
 check "$(status "$H1")" 5 "settled by the next pass"
 
+fi
+
 # I. exit codes of the other outcomes ------------------------------------------------------------------------------------
+if want I; then
 say "I. the other exit codes"
 keeper I1 LOW_BALANCE=1000000000000000000000
 check "$KRC" 3 "balance below LOW_BALANCE: the pass completes, then exit 3"
@@ -470,16 +558,196 @@ keeper I4 RPC=http://127.0.0.1:1
 check "$KRC" 1 "an unreachable RPC: exit 1"
 keeper I5 DRY_RUN=1 KEEPER_PK=
 check "$KRC" 0 "a dry run needs no key and exits 0"
+fi
+
+# J. a read that keeps failing part-way through the overdue scan ------------------------------------------------------
+if want J; then
+say "J. a read that keeps failing part-way through the overdue scan: the mark keeps what was read; ARM_MAX caps a pass"
+J="$(fire_n 6)" || fatal "fire failed"
+# shellcheck disable=SC2086
+anchor_by_service $J
+mine 2
+# shellcheck disable=SC2086
+fix_history_of $J
+keeper J0
+check "$KRC" 0 "keeper exit code"
+# shellcheck disable=SC2086
+check "$(count5 $J)" 6 "the six shots settled"
+# shellcheck disable=SC2086
+set -- $J
+set_mark "$1" # a mark from before these six shots, as an older saved state holds
+# a node that refuses every read of the fourth shot (shotState($4)), and quotes its own URL and key in the error
+fault_start J "eth_call:0xa5153884$(word_of "$4")"
+keeper J1 RPC="$FAULT_URL" LOW_BALANCE=1000000000000000000000
+fault_stop
+check "$(yes_if [ "$(grep_n "refused eth_call" "$WORK/relay-J.log")" -ge 1 ])" yes "the node refused the reads of shot $4"
+check "$KRC" 1 "a read that kept failing: exit 1"
+check "$(mark)" "$4" "the new mark is shot $4: the three shots read before the failure are not read again"
+check "$(grep_n "stopped on a read failure" "$WORK/J1.log")" 1 "the log says the scan stopped on a read failure"
+check "$(grep_n "top it up" "$WORK/J1.log")" 1 "the low-balance warning is printed on a failed pass too"
+check "$(grep_n -e "$FAULT_KEY" -e "127.0.0.1" "$WORK/J1.log")" 0 "the node's error quoted the RPC URL and its key; the log shows neither"
+check "$(yes_if [ "$(grep_n "drill fault at <rpc>; key <rpc>" "$WORK/J1.log")" -ge 1 ])" yes "it shows that error with both masked"
+keeper J2 ARM_MAX=2
+check "$KRC" 0 "keeper exit code"
+check "$(mark)" "$6" "ARM_MAX=2: the pass read shots $4 and $5 only, and left the mark at shot $6"
+check "$(grep_n "ARM_MAX (2) reached at shot $6" "$WORK/J2.log")" 1 "and said the next pass goes on from there"
+keeper J3
+check "$KRC" 0 "keeper exit code"
+check "$(mark)" "$(num "$VAULT" "nextShotId()(uint256)")" "the next pass read on to the end"
+fi
+
+# K. arms that the node's gas estimate stops or starves ---------------------------------------------------------------
+if want K; then
+say "K. an arm that never left (its gas estimate reverted) is judged at once; one that ran out of gas says so"
+K1="$(fire 1 0)" || fatal "fire failed"
+six_hours
+check "$(status "$K1")" 2 "shot $K1 overdue"
+nonce0="$(c nonce "$KEEPER")"
+fault_start K "eth_estimateGas:0xb992f766$(word_of "$K1")" # armFallback(K1): the estimate reverts
+t0="$(date +%s)"
+keeper K1 RPC="$FAULT_URL"
+took=$(($(date +%s) - t0))
+fault_stop
+check "$(yes_if [ "$(grep_n "refused eth_estimateGas" "$WORK/relay-K.log")" -ge 1 ])" yes "the node refused the arm's gas estimate"
+check "$KRC" 1 "exit 1: the shot is still overdue"
+check "$(grep_n "FAILED: armFallback($K1) not sent" "$WORK/K1.log")" 1 "reported as not sent"
+check "$(grep_n "watching the chain" "$WORK/K1.log")" 0 "judged at once: no 30 s watch for a transaction that never left"
+check "$(yes_if [ "$took" -lt 30 ])" yes "the whole pass took $took s, less than the 30 s watch"
+check "$(c nonce "$KEEPER") $(status "$K1")" "$nonce0 2" "nothing was sent; the shot is still overdue"
+fault_start K2 "eth_estimateGas:0xb992f766$(word_of "$K1")=0x7530" # an estimate of 30,000 gas: too little
+keeper K2 RPC="$FAULT_URL"
+fault_stop
+check "$KRC" 1 "exit 1: the arm failed and the shot is still overdue"
+ktx="$(tx_of "FAILED: armFallback\\($K1\\)" "$WORK/K2.log")"
+check "$(rstatus "$ktx") $(c tx "$ktx" gas 2>/dev/null)" "0 30000" \
+  "the arm was mined with the 30,000 gas the node estimated, and failed"
+check "$(grep_n "FAILED: armFallback($K1) tx $ktx reverted (out of gas" "$WORK/K2.log")" 1 "the log gives the reason: out of gas"
+check "$(grep_n "SUMMARY: .* transactions 1, .* failures 1," "$WORK/K2.log")" 1 "the summary counts that failed transaction and the failure"
+check "$(status "$K1")" 2 "shot $K1 still overdue"
+keeper K3
+check "$KRC" 0 "keeper exit code"
+check "$(grep_n "armFallback($K1) tx" "$WORK/K3.log")" 1 "the next pass armed it"
+mine 2
+fix_history "$(anchor_of "$K1")"
+keeper K4
+check "$KRC" 0 "keeper exit code"
+check "$(status "$K1")" 5 "and the pass after settled it"
+fi
+
+# L. the reason of a failed settle ------------------------------------------------------------------------------------
+if want L; then
+say "L. a failed settle's reason is the one its own block gives, not a later simulation's"
+L1="$(fire 1 0)" || fatal "fire failed"
+anchor_by_service "$L1"
+mine 2
+aL="$(anchor_of "$L1")"
+c rpc anvil_setStorageAt "$HISTORY" "$(printf '0x%x' $((aL % 8191)))" 0x0000000000000000000000000000000000000000000000000000000000000000 >/dev/null
+check "$(status "$L1")" 4 "shown ready (its anchor is mined), but its anchor hash is not served"
+# a node whose simulation of settleFallback at the latest block fails with an error of its own; a call for a given
+# block (a number, or the hash cast replays a failed transaction at) goes through
+fault_start L "eth_call:0x3e4fc037@latest"
+ctl="$(cast call "$VAULT" "settleFallback(uint256)" "$L1" --from "$KEEPER" --rpc-url "$FAULT_URL" 2>&1)"
+check "$(printf '%s\n' "$ctl" | grep -c "drill fault")" 1 "control: a simulation at the latest block through this node gets the node's error"
+keeper L1 RPC="$FAULT_URL"
+fault_stop
+check "$KRC" 1 "keeper exit code: a real failure"
+check "$(grep_n "FAILED: settleFallback($L1) tx 0x[0-9a-f]* reverted (GameVault: anchor hash unavailable" "$WORK/L1.log")" 1 \
+  "the reason is the vault's own, from the transaction's block"
+check "$(grep_n "drill fault" "$WORK/L1.log")" 0 "not a later simulation's"
+fix_history "$aL"
+keeper L2
+check "$KRC" 0 "keeper exit code once the hash is served"
+check "$(status "$L1")" 5 "settled by the next pass"
+fi
+
+# M. two vaults ----------------------------------------------------------------------------------------------------------
+if want M; then
+say "M. two vaults: vault #1's ready shot is settled before vault #0's overdue shot is armed"
+[ "$(num "$FACTORY" "vaultCount()(uint256)")" -ge 2 ] || fatal "the factory on the fork has fewer than two vaults"
+use_vault 1
+V1="$VAULT"
+unlocked "$PORTAL" "$TOKEN" "transfer(address,uint256)" "$SHOOTER" "$(echo "$BULLET * 10" | bc)"
+c send "$TOKEN" "approve(address,uint256)" "$VAULT" "$(echo "$BULLET * 10" | bc)" --private-key "$SHOOTER_PK" >/dev/null
+use_vault 0
+M0="$(fire 1 0)" || fatal "fire failed"
+six_hours
+use_vault 1
+M1="$(fire 1 1)" || fatal "fire failed"
+anchor_by_service "$M1"
+mine 2
+fix_history_of "$M1"
+check "$(status "$M1")" 4 "vault #1: shot $M1 ready"
+use_vault 0
+check "$(status "$M0")" 2 "vault #0: shot $M0 overdue"
+keeper M1
+check "$KRC" 0 "keeper exit code"
+stx="$(tx_of "settleFallback\\($M1\\)" "$WORK/M1.log")"
+atx="$(tx_of "armFallback\\($M0\\)" "$WORK/M1.log")"
+check "$(c tx "$stx" to 2>/dev/null | tr 'A-F' 'a-f') $(c tx "$atx" to 2>/dev/null | tr 'A-F' 'a-f')" "$(echo "$V1 $VAULT" | tr 'A-F' 'a-f')" \
+  "one settle on vault #1, one arm on vault #0"
+sn="$(c tx "$stx" nonce 2>/dev/null)"
+an="$(c tx "$atx" nonce 2>/dev/null)"
+check "$(yes_if [ "${sn:-x}" -lt "${an:-x}" ] 2>/dev/null)" yes "vault #1's settle went out before vault #0's arm (nonce ${sn:-?}, then ${an:-?})"
+mine 2
+fix_history "$(anchor_of "$M0")"
+keeper M2
+check "$KRC" 0 "keeper exit code"
+check "$(status "$M0")" 5 "vault #0's shot settled on the next pass"
+use_vault 1
+check "$(status "$M1")" 5 "vault #1's shot stays settled"
+use_vault 0
+fi
+
+# N. DRY_RUN -------------------------------------------------------------------------------------------------------------
+if want N; then
+say "N. DRY_RUN is 1 (read only), 0 or empty; anything else is a configuration error, with a ready shot waiting"
+N1="$(fire 1 0)" || fatal "fire failed"
+anchor_by_service "$N1"
+mine 2
+fix_history_of "$N1"
+nonce0="$(c nonce "$KEEPER")"
+keeper N1 DRY_RUN=true
+check "$KRC" 2 "DRY_RUN=true: configuration error, exit 2"
+check "$(c nonce "$KEEPER") $(status "$N1")" "$nonce0 4" "nothing sent: the ready shot is still open"
+keeper N2 DRY_RUN=yes
+check "$KRC" 2 "DRY_RUN=yes: exit 2 as well"
+keeper N3 DRY_RUN=
+check "$KRC" 0 "DRY_RUN empty: a normal pass"
+check "$(status "$N1")" 5 "which settled the ready shot"
+fi
+
+# O. a warning on cast's standard error ----------------------------------------------------------------------------------
+if want O; then
+say "O. a warning cast prints on its standard error (a nightly build does, on every call) spoils no value it read"
+mkdir -p "$WORK/warncast"
+printf '#!/bin/sh\necho "Warning: This is a nightly build of Foundry (the drill'"'"'s stand-in)" >&2\nexec "%s" "$@"\n' "$(command -v cast)" >"$WORK/warncast/cast"
+chmod +x "$WORK/warncast/cast"
+check "$(PATH="$WORK/warncast:$PATH" cast chain-id --rpc-url "$A" 2>&1 >/dev/null | grep -c "nightly build")" 1 "control: the stand-in cast prints the warning"
+O1="$(fire 1 0)" || fatal "fire failed"
+anchor_by_service "$O1"
+mine 2
+fix_history_of "$O1"
+keeper O1 PATH="$WORK/warncast:$PATH"
+check "$KRC" 0 "keeper exit code"
+check "$(grep_n -e "failed" -e "ERROR" "$WORK/O1.log")" 0 "no read failed, no error"
+check "$(status "$O1")" 5 "the ready shot settled"
+fi
+
+# closing checks: every keeper log -------------------------------------------------------------------------------
 leak=0
+urls=0
 for f in "$WORK"/*.log; do
-  [ "$f" = "$WORK/anvil.log" ] && continue
+  case "$f" in "$WORK/anvil.log" | "$WORK"/relay*.log) continue ;; esac
   if grep -q -i -F -e "${KEEPER_PK#0x}" -e "${SHOOTER_PK#0x}" "$f"; then leak=1; fi
+  # every RPC of the drill is on 127.0.0.1 (the fork, the fault relays with their made-up keys, an unreachable port)
+  if grep -q -F -e "127.0.0.1" -e "drill-secret-" "$f"; then urls=$((urls + 1)); echo "  RPC URL shown in $f"; fi
 done
 check "$leak" 0 "no private key appears in any keeper log"
+check "$urls" 0 "no RPC URL or key appears in any keeper log"
 
 flaky="$(grep -l "Fork Error" "$WORK"/*.log 2>/dev/null | grep -c -v -e anvil.log -e relay.log)"
 check "$flaky" 0 "no keeper pass met a fork upstream error (a failure here is the network's, not the keeper's: rerun)"
-echo "  relay: $(grep -c "failed" "$WORK/relay.log" 2>/dev/null || echo 0) upstream attempt(s) retried"
+echo "  relay: $(grep_n "failed" "$WORK/relay.log") upstream attempt(s) retried"
 
 say "result: $PASS passed, $FAIL failed (logs in $WORK)"
 [ "$FAIL" -eq 0 ]
