@@ -20,8 +20,12 @@
 # Service, players and other keepers: a transaction that loses a race is checked against the chain, and a shot that
 # someone else closed or armed first counts as done, not as a failure. A transaction that comes back without a receipt
 # (cast gave up waiting, or the node answered with an error after taking it) is judged the same way after watching the
-# chain for 30 s; only a shot still open then is a failure. One that never left (cast's gas estimate failed or
-# reverted, or the node refused it outright: no funds, a used nonce) is judged at once, without the wait. A failure
+# chain for 30 s; only a shot still open then is a failure. "nonce too low" is such an error, not a proof that the
+# transaction never left: cast sends eth_sendRawTransaction again after an HTTP 429 or 503, and a load-balanced node
+# may take a transaction and still answer with an error, so the used nonce can be the transaction's own. One that
+# never left (cast's gas estimate failed or reverted, or the node refused it outright: no funds, too little gas) is
+# judged at once, without the wait; an arm whose estimate the vault reverts as already anchored or already settled
+# lost to someone else, with no re-read (a node that lags behind would still show the shot overdue). A failure
 # says why, for settles and arms alike: the revert reason in the receipt (cast replays the transaction as of its own
 # block), else whether it used all of its gas limit, else the same call simulated as of that block, never a later one.
 #
@@ -216,7 +220,7 @@ shot_state() {
 # send <to> <sig> [args and cast options...]: sign and send from the keeper, wait for the receipt.
 # Sets TX_HASH, TX_OK (1 mined and succeeded, 0 otherwise), TX_GAS, TX_BLOCK and TX_JSON. Returns 1 when nothing
 # came back mined (not sent, or no receipt), with SEND_ERR (cast's whole error, scrubbed) and LAST_ERR (its last
-# line): the caller re-reads the chain to learn what happened.
+# line): the caller judges what happened (see may_be_out and already_done), mostly by re-reading the chain.
 send() {
   local out
   TX_HASH="" TX_OK=0 TX_GAS="" TX_BLOCK="" TX_JSON="" SEND_ERR=""
@@ -244,14 +248,28 @@ send() {
 # may_be_out: whether a transaction that came back without a receipt may still have gone out (cast gave up waiting
 # for it, or the node took it and answered with an error): anything but an error that proves it never left. cast
 # estimates the gas of a send that has no gas limit by running the call first, and stops before signing when that
-# fails or reverts; a node refuses outright a transaction it cannot pay for or whose nonce is used.
+# fails or reverts; a node refuses outright a transaction it cannot pay for or whose gas is below the intrinsic cost;
+# cast signs nothing with an invalid key. A used nonce proves nothing: cast's transport sends eth_sendRawTransaction
+# again after an HTTP 429 or 503, and a load-balanced node may take the transaction and still answer with an error, so
+# "nonce too low" can be about this very transaction's own nonce. It is watched like a missing receipt.
 may_be_out() {
   case "$SEND_ERR" in
     *"Failed to estimate gas"* | *"failed to estimate gas"* | *"execution reverted"*) return 1 ;;
-    *"insufficient funds"* | *"nonce too low"* | *"intrinsic gas too low"*) return 1 ;;
+    *"insufficient funds"* | *"intrinsic gas too low"*) return 1 ;;
     *"invalid private key"* | *"Invalid private key"*) return 1 ;;
   esac
   return 0
+}
+
+# already_done: whether cast's error says the vault refused the call because the shot is already anchored or already
+# settled. An arm's gas estimate runs the call on the node's latest state before anything is signed, so such an arm
+# never left and someone else was first; a re-read could come from a node that lags behind and still shows the shot
+# overdue.
+already_done() {
+  case "$SEND_ERR" in
+    *"already anchored"* | *"already settled"*) return 0 ;;
+  esac
+  return 1
 }
 
 # at_tx_block: the cast option that reads the chain as of the last transaction's block (empty when it has none),
@@ -499,6 +517,14 @@ arm_overdue() {
         [ -n "$TX_HASH" ] && A_TXS=$((A_TXS + 1))
         out=0
         [ -z "$TX_HASH" ] && may_be_out && out=1
+        if [ -z "$TX_HASH" ] && [ "$out" = 0 ] && already_done; then
+          # the vault refused it as already anchored or settled: lost to someone else, with no re-read (see
+          # already_done). `low` stays at or below this shot, so the next pass reads it again.
+          log "  armFallback($id) not sent (${LAST_ERR%%, data: *}): the vault refused it, so shot $id was anchored or closed by someone else first; going on"
+          LOST=$((LOST + 1))
+          id=$((id + 1))
+          continue
+        fi
         # shellcheck disable=SC2046 # at_tx_block is empty or two words by design
         if ! shot_state "$v" "$id" $(at_tx_block); then
           log "  read failed at shot $id: $LAST_ERR"

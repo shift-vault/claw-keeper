@@ -10,8 +10,9 @@
 # KEEPER_SH the keeper under test (default: ./keeper.sh). DRILL_ONLY (optional) runs only the sections it names, e.g.
 # DRILL_ONLY="J K" (each section fires its own shots; the setup and the closing checks always run).
 # Needs anvil, cast, bc and python3 (test/fork-relay.py: anvil reads the public endpoint through it, with retries, so
-# a dropped connection there does not strand a transaction in the fork's pool; in sections J to L a second relay with
-# a fault rule, between the keeper and the fork, plays a node that answers one kind of call its own way).
+# a dropped connection there does not strand a transaction in the fork's pool; in sections J to L and P a second relay
+# with a fault rule, between the keeper and the fork, plays a node that answers one kind of call its own way, or a
+# reader that lags behind the chain).
 #
 # The fork plays the Trigger Service's backend by impersonating the address that holds its TRIGGER_ROLE: it runs
 # each shot's first request (the anchor) and never the second (the settle), which is exactly the case the keeper
@@ -232,16 +233,18 @@ tx_of() { sed -En "s/.*$1 tx (0x[0-9a-f]+).*/\\1/p" "$2" | head -1; } # tx_of <c
 rstatus() {
   c receipt "$1" status 2>/dev/null | awk '{ s = $1 } END { if (s == "true" || s == "1") print 1; else if (s == "false" || s == "0") print 0; else print s }'
 }
-# fault_start <name> <method>:<call data prefix>[@<block>][=<result>]: a second relay between the keeper and the fork,
-# playing a node that answers that call its own way (see test/fork-relay.py); its own log is relay-<name>.log. Sets
-# FAULT_URL, whose path is a made-up API key (FAULT_KEY) that must never appear in the keeper's log (the node's errors
-# quote it). fault_stop stops it.
+# fault_start <name> <method>:<call data prefix>[@<block>][=<result>|~<message>] [lag=<seconds>[@<block>]]: a second
+# relay between the keeper and the fork, playing a node that answers that call its own way, and with lag= a reader
+# that lags behind the chain (see test/fork-relay.py; an empty rule plays only the lagging reader); its own log is
+# relay-<name>.log. Sets FAULT_URL, whose path is a made-up API key (FAULT_KEY) that must never appear in the keeper's
+# log (the node's errors quote it). fault_stop stops it.
 fault_start() {
-  local n=0
+  local n=0 name="$1"
+  shift
   FAULT_PORT="$(free_port 28745)"
   FAULT_KEY="drill-secret-$(od -An -tx1 -N8 /dev/urandom | tr -d ' \n')"
   FAULT_URL="http://127.0.0.1:$FAULT_PORT/$FAULT_KEY"
-  python3 test/fork-relay.py "$FAULT_PORT" "$A" "$2" 2>"$WORK/relay-$1.log" &
+  python3 test/fork-relay.py "$FAULT_PORT" "$A" "$@" 2>"$WORK/relay-$name.log" &
   FAULT_PID=$!
   until lsof -nP -iTCP:"$FAULT_PORT" -sTCP:LISTEN >/dev/null 2>&1; do
     n=$((n + 1))
@@ -252,6 +255,14 @@ fault_start() {
 fault_stop() { kill "$FAULT_PID" 2>/dev/null; wait "$FAULT_PID" 2>/dev/null; FAULT_PID=""; }
 yes_if() { if "$@"; then echo yes; else echo no; fi; } # yes_if <test...>: "yes" or "no", for check
 grep_n() { local n; n="$(grep -c "$@" 2>/dev/null)"; echo "${n:-0}"; } # grep_n <grep args> <one file>: the count
+lc() { tr 'A-F' 'a-f'; }
+# took_tx <relay log>: the first transaction a ~ fault rule forwarded and the fork took
+took_tx() { sed -En 's/.*forwarded eth_sendRawTransaction, and the upstream took it as (0x[0-9a-f]+).*/\1/p' "$1" | head -1; }
+# state_via <id> <rpc>: the shot's status as the node at <rpc> reads it
+state_via() {
+  cast call "$VAULT" "shotState(uint256)(uint8,uint256,uint256,uint64,uint64,uint64,bool,uint256,uint256,uint256[])" "$1" \
+    --rpc-url "$2" 2>&1 | awk '{ print $1; exit }'
+}
 
 # 0. before anything: the vault's queue is empty ------------------------------------------------------------------
 if want 0; then
@@ -731,6 +742,111 @@ keeper O1 PATH="$WORK/warncast:$PATH"
 check "$KRC" 0 "keeper exit code"
 check "$(grep_n -e "failed" -e "ERROR" "$WORK/O1.log")" 0 "no read failed, no error"
 check "$(status "$O1")" 5 "the ready shot settled"
+fi
+
+# P. a node that takes a transaction and answers "nonce too low"; arms the vault refuses as already done ---------------
+if want P; then
+say "P1. an own settle the node took, then answered \"nonce too low\": watched, found closed, not sent twice"
+P1="$(fire 1 0)" || fatal "fire failed"
+anchor_by_service "$P1"
+mine 2
+fix_history_of "$P1"
+check "$(status "$P1")" 4 "shot $P1 ready"
+nonce0="$(c nonce "$KEEPER")"
+# a node that forwards settleFallback(P1) to the fork and answers "nonce too low" all the same, and whose eth_call at
+# the latest block answers as of the block before that transaction for 9 s after it (a reader that lags behind)
+fault_start P1 "eth_sendRawTransaction:0x3e4fc037$(word_of "$P1")~nonce too low" lag=9
+keeper P1 RPC="$FAULT_URL"
+fault_stop
+ptx="$(took_tx "$WORK/relay-P1.log")"
+check "$(grep_n "forwarded eth_sendRawTransaction, and the upstream took it" "$WORK/relay-P1.log")" 1 \
+  "the node took settleFallback($P1) once, and answered nonce too low"
+check "$(rstatus "$ptx") $(c tx "$ptx" from 2>/dev/null | lc)" "1 $(echo "$KEEPER" | lc)" \
+  "control: that was the keeper's own transaction, and it went through"
+check "$(yes_if [ "$(grep_n "answered eth_call as of block" "$WORK/relay-P1.log")" -ge 1 ])" yes \
+  "control: the node's reads lagged behind that transaction"
+check "$KRC" 0 "keeper exit code"
+check "$(status "$P1")" 5 "shot $P1 settled"
+check "$(($(c nonce "$KEEPER") - nonce0))" 1 "one transaction: settleFallback($P1) was not sent a second time"
+check "$(grep_n "settleFallback($P1) came back without a receipt (.*nonce too low.*), but shot $P1 is closed now" "$WORK/P1.log")" 1 \
+  "counted as closed after watching the chain"
+check "$(grep_n -e "not sent" -e "FAILED" "$WORK/P1.log")" 0 "no line calls it not sent, or a failure"
+check "$(grep_n "SUMMARY: .* done without a receipt 1, failures 0," "$WORK/P1.log")" 1 "the summary counts it done without a receipt"
+
+say "P2. an own arm the node took, then answered \"nonce too low\": watched, found anchored"
+P2="$(fire 1 1)" || fatal "fire failed"
+six_hours
+check "$(status "$P2")" 2 "shot $P2 overdue"
+nonce0="$(c nonce "$KEEPER")"
+fault_start P2 "eth_sendRawTransaction:0xb992f766$(word_of "$P2")~nonce too low" lag=9
+keeper P2 RPC="$FAULT_URL"
+fault_stop
+ptx="$(took_tx "$WORK/relay-P2.log")"
+check "$(grep_n "forwarded eth_sendRawTransaction, and the upstream took it" "$WORK/relay-P2.log")" 1 \
+  "the node took armFallback($P2) once, and answered nonce too low"
+check "$(rstatus "$ptx") $(c tx "$ptx" from 2>/dev/null | lc) $(anchor_of "$P2")" \
+  "1 $(echo "$KEEPER" | lc) $(($(c receipt "$ptx" blockNumber 2>/dev/null) + 1))" \
+  "control: that was the keeper's own transaction, and it anchored the shot at the block after its own"
+check "$(yes_if [ "$(grep_n "answered eth_call as of block" "$WORK/relay-P2.log")" -ge 1 ])" yes \
+  "control: the node's reads lagged behind that transaction"
+check "$KRC" 0 "keeper exit code"
+check "$(($(c nonce "$KEEPER") - nonce0))" 1 "one transaction"
+check "$(grep_n "armFallback($P2) came back without a receipt (.*nonce too low.*), but shot $P2 is anchored now" "$WORK/P2.log")" 1 \
+  "counted as anchored after watching the chain"
+check "$(grep_n -e "not sent" -e "FAILED" "$WORK/P2.log")" 0 "no line calls it not sent, or a failure"
+check "$(grep_n "SUMMARY: .* done without a receipt 1, failures 0," "$WORK/P2.log")" 1 "the summary counts it done without a receipt"
+mine 2
+fix_history "$(anchor_of "$P2")"
+keeper P2b
+check "$KRC $(status "$P2")" "0 5" "the next pass settled shot $P2"
+
+say "P3. an arm the vault refuses as already anchored (a rival anchored it first), through a reader that lags behind"
+P3="$(fire 1 2)" || fatal "fire failed"
+six_hours
+check "$(status "$P3")" 2 "shot $P3 overdue"
+lagb="$(c block-number)"
+c send "$VAULT" "armFallback(uint256)" "$P3" --private-key "$RIVAL_PK" >/dev/null
+check "$(yes_if [ "$(anchor_of "$P3")" != 0 ])" yes "a rival anchored shot $P3 first"
+nonce0="$(c nonce "$KEEPER")"
+# a node whose eth_call at the latest block answers as of the block before the rival's arm; its gas estimates are
+# the chain's own
+fault_start P3 "" "lag=600@$lagb"
+check "$(state_via "$P3" "$FAULT_URL")" 2 "control: through this node, shot $P3 still looks overdue"
+keeper P3 RPC="$FAULT_URL"
+fault_stop
+check "$KRC" 0 "exit 0: a race lost to someone else, not a failure"
+check "$(grep_n "armFallback($P3) not sent (.*already anchored.*): the vault refused it, so shot $P3 was anchored or closed by someone else first" "$WORK/P3.log")" 1 \
+  "counted as lost to someone else, on the vault's own refusal"
+check "$(grep_n "FAILED" "$WORK/P3.log")" 0 "no failure reported"
+check "$(grep_n "SUMMARY: .* races lost to others 1, .* failures 0," "$WORK/P3.log")" 1 "the summary counts one race lost"
+check "$(c nonce "$KEEPER")" "$nonce0" "nothing sent"
+check "$(mark)" "$P3" "the mark stays at shot $P3, which the reader still showed overdue"
+mine 2
+fix_history "$(anchor_of "$P3")"
+keeper P3b
+check "$KRC $(status "$P3") $(mark)" "0 5 $(num "$VAULT" "nextShotId()(uint256)")" \
+  "the next pass, reading the chain as it is, settled shot $P3 and moved the mark past it"
+
+say "P4. an arm the vault refuses as already settled (a rival armed and settled it first), through a reader that lags behind"
+P4="$(fire 1 0)" || fatal "fire failed"
+six_hours
+lagb="$(c block-number)"
+c send "$VAULT" "armFallback(uint256)" "$P4" --private-key "$RIVAL_PK" >/dev/null
+mine 2
+fix_history "$(anchor_of "$P4")"
+c send "$VAULT" "settleFallback(uint256)" "$P4" --gas-limit 3000000 --private-key "$RIVAL_PK" >/dev/null
+check "$(status "$P4")" 5 "a rival armed and settled shot $P4 first"
+nonce0="$(c nonce "$KEEPER")"
+fault_start P4 "" "lag=600@$lagb"
+check "$(state_via "$P4" "$FAULT_URL")" 2 "control: through this node, shot $P4 still looks overdue"
+keeper P4 RPC="$FAULT_URL"
+fault_stop
+check "$KRC" 0 "exit 0: a race lost to someone else, not a failure"
+check "$(grep_n "armFallback($P4) not sent (.*already settled.*): the vault refused it, so shot $P4 was anchored or closed by someone else first" "$WORK/P4.log")" 1 \
+  "counted as lost to someone else, on the vault's own refusal"
+check "$(grep_n "FAILED" "$WORK/P4.log") $(c nonce "$KEEPER") $(mark)" "0 $nonce0 $P4" "no failure, nothing sent, and the mark stays at shot $P4"
+keeper P4b
+check "$KRC $(mark)" "0 $(num "$VAULT" "nextShotId()(uint256)")" "the next pass moved the mark past it"
 fi
 
 # closing checks: every keeper log -------------------------------------------------------------------------------
