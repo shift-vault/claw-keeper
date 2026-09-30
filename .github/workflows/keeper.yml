@@ -1,13 +1,25 @@
 name: keeper
 
 # One keeper pass every 5 minutes: settle the claw vaults' settle queues from their heads and arm the shots the
-# Trigger Service never anchored. Once a day a keep-alive job makes sure GitHub never turns the schedule off.
-# See README.md.
+# Trigger Service never anchored.
+#
+# GitHub's own schedule is not relied on for the 5 minutes: measured on this repository, the `*/5` schedule fired
+# twice in five hours (gaps of more than three hours), while the settle window is about 61 minutes. So each run keeps
+# passing every 5 minutes for `minutes` minutes and then starts the next run itself (a relay). The schedule stays as
+# a restart: if the relay ever stops, the next scheduled run starts a new one. Only one run passes at a time. Once a day
+# a keep-alive job makes sure GitHub never turns the schedule off. See README.md.
 on:
   schedule:
     - cron: "*/5 * * * *"
-    - cron: "17 3 * * *" # daily: the same pass, plus the keep-alive job
+    - cron: "17 3 * * *" # daily: the same relay, plus the keep-alive job
   workflow_dispatch:
+    inputs:
+      minutes:
+        description: how long this run keeps passing before it hands over to the next run
+        default: "55"
+      relay:
+        description: start the next run when this one ends (false for a one-off run)
+        default: "true"
 
 permissions:
   contents: read
@@ -17,14 +29,18 @@ jobs:
     # only in this repository: a fork or a copy must not run a second keeper by accident (edit the name to run one)
     if: ${{ github.repository == 'shift-vault/claw-keeper' }}
     runs-on: ubuntu-latest
-    # a pass is normally well under a minute; the limit leaves room for a long queue (up to SWEEP_MAX = 500 settles a
-    # vault, one transaction each) without letting a hung pass hold the next ones back for most of the settle window.
-    # A pass cut off by it is cancelled, and its marks are not saved: the next run goes on from the last saved ones.
-    timeout-minutes: 30
-    # never two passes at once; a run that arrives while one is going waits for it instead of cancelling it
+    # the relay's minutes plus room for a long last pass (up to SWEEP_MAX = 500 settles a vault, one transaction each).
+    # A run cut off by it is cancelled, hands over nothing and saves no marks: the next scheduled run restarts the
+    # relay from the last saved marks.
+    timeout-minutes: 120
+    # never two runs passing at once; a run that arrives while one is going waits for it (GitHub keeps only the newest
+    # waiting run), so a scheduled run that finds the relay going is replaced by the relay's own next run
     concurrency:
       group: claw-keeper-pass
       cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: write # to start the relay's next run (workflow_dispatch on this workflow, nothing else)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,8 +51,8 @@ jobs:
           version: v1.7.1 # the release the fork drill (test/fork-drill.sh) was run with
           cache: false
 
-      # the low-water marks: restore the newest saved state; after the pass, save a new entry if there is a mark to
-      # keep (see the save step)
+      # the low-water marks: restore the newest saved state; after the relay's passes, save a new entry if there is a
+      # mark to keep (see the save step)
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: state
@@ -46,32 +62,62 @@ jobs:
       - name: State directory
         run: mkdir -p state
 
-      - name: BNB Chain (56)
+      - name: Passes every 5 minutes
+        id: passes
         env:
-          CHAIN_ID: "56"
-          # a URL with an API key belongs in the secret RPC_56: Actions prints each step's env at the top of its log,
-          # and masks only secrets there
-          RPC: ${{ secrets.RPC_56 || vars.RPC_56 || 'https://bsc-mainnet.public.blastapi.io' }}
+          MINUTES: ${{ inputs.minutes || '55' }}
           KEEPER_PK: ${{ secrets.KEEPER_PK }}
           STATE_DIR: state
-        run: ./keeper.sh
+          # a URL with an API key belongs in the secret RPC_56 / RPC_97: Actions prints each step's env at the top of
+          # its log, and masks only secrets there
+          RPC_56: ${{ secrets.RPC_56 || vars.RPC_56 || 'https://bsc-mainnet.public.blastapi.io' }}
+          RPC_97: ${{ secrets.RPC_97 || vars.RPC_97 || 'https://bsc-testnet-rpc.publicnode.com' }}
+          RUN_97: ${{ vars.RUN_97 }}
+        run: |
+          case "$MINUTES" in ''|*[!0-9]*) echo "::error::minutes must be a whole number, got '$MINUTES'"; exit 2 ;; esac
+          end=$(( $(date +%s) + MINUTES * 60 ))
+          n=0; failed=0
+          while :; do
+            t0=$(date +%s); n=$((n + 1))
+            echo "::group::pass $n at $(date -u +%H:%M:%S) UTC"
+            if CHAIN_ID=56 RPC="$RPC_56" ./keeper.sh; then :; else rc=$?; failed=$((failed + 1)); echo "::warning::pass $n: chain 56 exited $rc"; fi
+            if [ "$RUN_97" = "true" ]; then
+              if CHAIN_ID=97 RPC="$RPC_97" ./keeper.sh; then :; else rc=$?; failed=$((failed + 1)); echo "::warning::pass $n: chain 97 exited $rc"; fi
+            fi
+            echo "::endgroup::"
+            next=$(( t0 + 300 ))
+            if [ "$next" -ge "$end" ]; then break; fi
+            now=$(date +%s)
+            if [ "$now" -lt "$next" ]; then sleep $(( next - now )); fi
+          done
+          echo "$n passes, $failed failed"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
 
-      - name: BNB Chain testnet (97)
-        if: ${{ !cancelled() && vars.RUN_97 == 'true' }}
-        env:
-          CHAIN_ID: "97"
-          RPC: ${{ secrets.RPC_97 || vars.RPC_97 || 'https://bsc-testnet-rpc.publicnode.com' }}
-          KEEPER_PK: ${{ secrets.KEEPER_PK }}
-          STATE_DIR: state
-        run: ./keeper.sh
-
-      # only when state/ holds a mark file (restored, or written by this pass): after a restore that missed and a pass
+      # only when state/ holds a mark file (restored, or written by a pass): after a restore that missed and passes
       # that wrote nothing, an empty entry would become the newest and hide the older good one from the next restore
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ !cancelled() && hashFiles('state/claw-*.from') != '' }}
         with:
           path: state
           key: keeper-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # the relay: start the next run before this one ends. A run started with the workflow's own token is one of the
+      # two event kinds GitHub lets that token trigger (workflow_dispatch). It waits in the concurrency group until this
+      # run has finished.
+      - name: Hand over to the next run
+        if: ${{ !cancelled() && (inputs.relay || 'true') == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run keeper.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+
+      # after the hand-over, so a failed pass marks this run red without stopping the relay
+      - name: Result
+        if: ${{ !cancelled() }}
+        run: |
+          if [ "${{ steps.passes.outputs.failed }}" != "0" ]; then
+            echo "::error::${{ steps.passes.outputs.failed }} keeper pass(es) failed in this run; see the warnings above"
+            exit 1
+          fi
 
   # GitHub turns off the schedule of a public repository after 60 days without activity. Once a day this job checks
   # the age of the newest commit and, when it is 30 days or older, commits a one-line heartbeat file with the
